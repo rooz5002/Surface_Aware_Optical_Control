@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 '''
-surface_aware_optic_test_v3.py
+surface_aware_optic_test_v4.py
 
 =================================
 
@@ -12,18 +12,21 @@ Input:
     method,surface,lighting,repeat,reference_mm,measured_mm,
     brightness,dynamic_range,laser,green,exposure_us
 
+Optional columns: timestamp, run_id, run_number, software_version,
+git_commit, simulation_active, demo_mode.
+
 The program does NOT generate or modify measurements.
 
 This program reads the CSV log produced by GapCal and calculates the measurement
 to produce test result analysis for our academic paper
-in 
-Robotics and AI Labs
-Huaian Univversity
+in
+Robotics and AI Research Labs
+Huai'an University
 
 By: Dr. Amir Ali Mokhtarzadeh
 *****************************
 
-The experiments using Gapcal, a contactless gap and flush measurment
+The experiments using Gapcal, a contactless gap and flush measurement
 device developed in our Lab 2019-2021
 
 Experimental structure:
@@ -31,7 +34,11 @@ Experimental structure:
     6 surfaces
     2 lighting conditions
     10 repeats per method/surface/lighting configuration
-    360 measurements total
+    360 measurements in the primary runs (run_number = 1)
+
+Additional runs of a configuration (run_number >= 2) are allowed. They are
+NOT included in the main statistics or Table IV; they are reported
+separately in Run_Comparison.csv as a reproducibility check.
 
 The calculations follow the definitions stated in the accompanying paper:
     error = measured - reference
@@ -45,8 +52,8 @@ A configuration is classified as in-tolerance when:
     AND at least 8 of 10 repeats have abs(error) <= 0.10 mm.
 
 Usage:
-    python analyze_gapcal_test.py Gapcal_Test_log.xlsx
-    python analyze_gapcal_test.py Gapcal_Test_log.csv --output results
+    python surface_aware_optic_test_v4.py Gapcal_Test1.csv
+    python surface_aware_optic_test_v4.py Gapcal_Test1.csv --output results
 '''
 
 from __future__ import annotations
@@ -258,6 +265,18 @@ def validate_dataset(df: pd.DataFrame) -> pd.DataFrame:
         if data["run_number"].isna().any():
             raise ValueError("Invalid run_number values found.")
 
+    span = data.groupby("run_id", sort=False)[["method", "surface", "lighting"]].nunique()
+    mixed = span[(span > 1).any(axis=1)]
+    if not mixed.empty:
+        raise ValueError(
+            "Each run_id must belong to exactly one method/surface/lighting "
+            "configuration. Mixed run_id(s): " + ", ".join(mixed.index.astype(str))
+        )
+
+    run_numbers = data.groupby("run_id", sort=False)["run_number"].nunique()
+    if (run_numbers > 1).any():
+        raise ValueError("A run_id contains more than one run_number.")
+
     run_counts = data.groupby("run_id", sort=False).size()
     bad_runs = run_counts[run_counts != EXPECTED_REPEATS]
     if not bad_runs.empty:
@@ -286,6 +305,33 @@ def validate_dataset(df: pd.DataFrame) -> pd.DataFrame:
     # Provenance fields are retained. True simulation/demo flags are reported, not rejected.
     data["error_mm"] = data["measured_mm"] - data["reference_mm"]
     return data
+
+
+def primary_runs(data: pd.DataFrame) -> pd.DataFrame:
+    '''Return the primary run (run_number = 1) of every configuration.
+
+    The main statistics and Table IV use exactly one run per
+    method/surface/lighting configuration, so every method has N = 120
+    and every configuration has the same weight.
+    '''
+    primary = data[data["run_number"] == 1]
+    key = ["method", "surface", "lighting"]
+    runs = primary.groupby(key, sort=False)["run_id"].nunique()
+
+    if len(runs) != 36:
+        missing = (
+            data.groupby(key, sort=False).size().index.difference(runs.index)
+        )
+        raise ValueError(
+            "Every configuration needs a primary run (run_number = 1). "
+            f"Missing: {list(missing)}"
+        )
+    if (runs != 1).any():
+        raise ValueError(
+            "More than one primary run (run_number = 1) found for: "
+            + ", ".join("/".join(k) for k in runs[runs != 1].index)
+        )
+    return primary
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +372,7 @@ def per_configuration_statistics(data: pd.DataFrame) -> pd.DataFrame:
             "Within_Tolerance_Count": tolerance_count(errors),
             "Within_Tolerance_Percent": 100.0*tolerance_count(errors)/len(errors),
             "Configuration_In_Tolerance": configuration_in_tolerance(errors),
+            "Primary_Run": int(first["run_number"]) == 1,
         })
     return pd.DataFrame(rows)
 
@@ -384,17 +431,33 @@ def table_iv(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_comparison(data: pd.DataFrame) -> pd.DataFrame:
+    """Per-run statistics for configurations measured more than once.
+
+    Uses ALL runs (primary and additional). Returns an empty table when no
+    configuration was repeated.
+    """
     config = per_configuration_statistics(data)
-    counts = config.groupby(["Method", "Surface", "Lighting"]).size()
-    repeated = counts[counts > 1].index
-    if len(repeated) == 0:
+    key = ["Method", "Surface", "Lighting"]
+    runs_per_config = config.groupby(key)["Run_ID"].transform("count")
+    repeated = config[runs_per_config > 1].copy()
+    if repeated.empty:
         return pd.DataFrame()
-    return config.merge(
-        config.groupby(["Method", "Surface", "Lighting"])["Sigma_mm"]
-        .agg(["min", "max", "mean"]).reset_index(),
-        on=["Method", "Surface", "Lighting"],
-        suffixes=("", "_Across_Runs")
-    )[config["Method"].isin(config["Method"])]
+
+    spread = (
+        repeated.groupby(key)
+        .agg(
+            Runs=("Run_ID", "count"),
+            Mean_Error_Range_mm=("Mean_Error_mm", lambda s: s.max() - s.min()),
+            Sigma_Min_mm=("Sigma_mm", "min"),
+            Sigma_Max_mm=("Sigma_mm", "max"),
+        )
+        .reset_index()
+    )
+    return (
+        repeated.merge(spread, on=key)
+        .sort_values(key + ["Run_Number"])
+        .reset_index(drop=True)
+    )
 
 
 def provenance_table(data: pd.DataFrame) -> pd.DataFrame:
@@ -527,22 +590,26 @@ def make_figures(
 
 def print_summary(
     data: pd.DataFrame,
+    primary: pd.DataFrame,
     overall: pd.DataFrame,
     table: pd.DataFrame,
+    runs: pd.DataFrame,
 ) -> None:
     print()
     print("=" * 72)
-    print("surface aware optic test v3")
-    print("Robotics annd AI Research Labs")
+    print("Surface-Aware Optic Test v4")
+    print("Robotics and AI Research Labs")
     print("Huai'an University")
-    print("Under Dr. Amir Ali Mokhtarrzadeh Supervision")
+    print("Under the supervision of Dr. Amir Ali Mokhtarzadeh")
     print("=" * 72)
-    print(f"Measurements:       {len(data)}")
-    print(f"Independent runs:   {data['run_id'].nunique()}")
+    print(f"Measurements:       {len(data)} in file, {len(primary)} in primary runs")
+    print(f"Runs:               {data['run_id'].nunique()} in file, "
+          f"{primary['run_id'].nunique()} primary, "
+          f"{data['run_id'].nunique() - primary['run_id'].nunique()} additional")
     print(f"Methods:            {data['method'].nunique()}")
     print(f"Surfaces:           {data['surface'].nunique()}")
     print(f"Lighting conditions:{data['lighting'].nunique()}")
-    print(f"Reference:          {data['reference_mm'].iloc[0]:.3f} mm")
+    print(f"Reference:          {primary['reference_mm'].iloc[0]:.3f} mm")
     print(f"Repeats/config:     {EXPECTED_REPEATS}")
     print()
 
@@ -558,11 +625,11 @@ def print_summary(
         ]
     ].copy()
 
-    print("OVERALL STATISTICS")
+    print("OVERALL STATISTICS (primary runs)")
     print(display.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
     print()
 
-    print("TABLE IV TOLERANCE RESULT")
+    print("TABLE IV TOLERANCE RESULT (primary runs)")
     print(
         table[
             [
@@ -584,6 +651,31 @@ def print_summary(
         "Tolerance criterion: mean error within ±0.10 mm AND "
         "at least 8 of 10 repeats within ±0.10 mm."
     )
+
+    if not runs.empty:
+        print()
+        print("REPRODUCIBILITY (configurations measured more than once, all runs)")
+        print(
+            runs[
+                [
+                    "Run_ID", "Run_Number", "Method", "Surface", "Lighting",
+                    "Mean_Error_mm", "RMSE_mm", "Sigma_mm",
+                    "Configuration_In_Tolerance",
+                ]
+            ].to_string(index=False, float_format=lambda x: f"{x:.6f}")
+        )
+
+    flags = [c for c in ["simulation_active", "demo_mode"] if c in data.columns]
+    for flag in flags:
+        values = data[flag].astype(str).str.strip().str.lower()
+        if values.isin(["true", "1", "yes"]).any():
+            print()
+            print(f"WARNING: '{flag}' is TRUE for some measurements. "
+                  "These are not physical measurements.")
+    if not flags and "software_version" not in data.columns:
+        print()
+        print("NOTE: no provenance columns (software_version, simulation_active, "
+              "demo_mode) in the input file.")
     print("=" * 72)
 
 
@@ -615,10 +707,14 @@ def main() -> int:
 
         args.output.mkdir(parents=True, exist_ok=True)
 
-        overall = overall_statistics(data)
+        primary = primary_runs(data)
+
+        # Main results: primary runs only (one run per configuration).
+        overall = overall_statistics(primary)
+        surface = per_surface_statistics(primary)
+        table = table_iv(primary)
+        # Per-run listing: every run, with a Primary_Run flag.
         configuration = per_configuration_statistics(data)
-        surface = per_surface_statistics(data)
-        table = table_iv(data)
 
         # Save derived tables.
         overall.to_csv(
@@ -643,8 +739,8 @@ def main() -> int:
             runs.to_csv(args.output / "Run_Comparison.csv", index=False)
         provenance_table(data).to_csv(args.output / "Provenance.csv", index=False)
 
-        make_figures(data, surface, args.output)
-        print_summary(data, overall, table)
+        make_figures(primary, surface, args.output)
+        print_summary(data, primary, overall, table, runs)
 
         print()
         print(f"Results written to: {args.output.resolve()}")
