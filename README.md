@@ -1,4 +1,4 @@
-# Surface Aware Test
+# Surface Aware Optical Control
 
 This public repository accompanies our academic paper on the **Surface Aware methodology**. It contains the analysis program and the test data used to produce the results reported in the paper.
 
